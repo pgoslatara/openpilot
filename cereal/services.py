@@ -3,10 +3,15 @@ from typing import Optional
 
 
 class Service:
-  def __init__(self, should_log: bool, frequency: float, decimation: Optional[int] = None):
+  def __init__(self, should_log: bool, frequency: float, decimation: Optional[int] = None, big_queue: bool = False):
     self.should_log = should_log
     self.frequency = frequency
     self.decimation = decimation
+
+    # this flag makes the MSGQ rinbguffer 10MB for larger messages.
+    # TODO: currently these were chosen with selfdrive/debug/analyze-msg-size.py,
+    # but it should be determined automatically from the capnp schema.
+    self.big_queue = big_queue
 
 
 _services: dict[str, tuple] = {
@@ -20,7 +25,7 @@ _services: dict[str, tuple] = {
   "gpsNMEA": (True, 9.),
   "deviceState": (True, 2., 1),
   "touch": (True, 20., 1),
-  "can": (True, 100., 2053),  # decimation gives ~3 msgs in a full segment
+  "can": (True, 100., 2053, big_queue=True),  # decimation gives ~3 msgs in a full segment
   "controlsState": (True, 100., 10),
   "selfdriveState": (True, 100., 10),
   "pandaStates": (True, 10., 1),
@@ -62,7 +67,7 @@ _services: dict[str, tuple] = {
   "wideRoadEncodeIdx": (False, 20., 1),
   "wideRoadCameraState": (True, 20., 20),
   "drivingModelData": (True, 20., 10),
-  "modelV2": (True, 20.),
+  "modelV2": (True, 20., big_queue=True),
   "managerState": (True, 2., 1),
   "uploaderState": (True, 0., 1),
   "navInstruction": (True, 1., 10),
