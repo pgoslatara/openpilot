@@ -54,6 +54,16 @@ class ReplayStats:
       return 0
     return min(lag for _, lag in self._lag_events)
 
+
+@dataclass
+class BenchmarkStats:
+  """Tracks benchmark timeline events."""
+  process_start_ts: int = 0
+  timeline: list = field(default_factory=list)  # [(timestamp_ns, description)]
+
+  def record(self, description: str) -> None:
+    self.timeline.append((time.monotonic_ns(), description))
+
 DEMO_ROUTE = "a2a0ccea32023010|2023-07-27--13-01-19"
 
 
@@ -99,6 +109,12 @@ class Replay:
 
     # Timing stats for observability
     self._stats = ReplayStats()
+
+    # Benchmark mode state
+    self._benchmark_stats = BenchmarkStats()
+    self._benchmark_stats.process_start_ts = time.monotonic_ns()
+    self._benchmark_done = False
+    self._benchmark_cv = threading.Condition()
 
     # Callbacks
     self.on_segments_merged: Optional[Callable[[], None]] = None
@@ -205,6 +221,15 @@ class Replay:
   def install_event_filter(self, filter_fn: Callable) -> None:
     self._event_filter = filter_fn
 
+  @property
+  def benchmark_stats(self) -> BenchmarkStats:
+    return self._benchmark_stats
+
+  def wait_for_finished(self) -> None:
+    """Wait for benchmark mode to complete."""
+    with self._benchmark_cv:
+      self._benchmark_cv.wait_for(lambda: self._benchmark_done)
+
   def load(self) -> bool:
     log.info(f"loading route {self._seg_mgr._route_name}")
     if not self._seg_mgr.load():
@@ -214,6 +239,9 @@ class Replay:
     if segments:
       self._min_seconds = min(segments) * 60
       self._max_seconds = (max(segments) + 1) * 60
+
+    if self.has_flag(ReplayFlags.BENCHMARK):
+      self._benchmark_stats.record("route metadata loaded")
     return True
 
   def start(self, seconds: int = 0) -> None:
@@ -323,6 +351,9 @@ class Replay:
           camera_sizes[cam_type] = (fr.w, fr.h)
       if camera_sizes:
         self._camera_server = CameraServer(camera_sizes)
+        # Warm the cache before playback to prevent initial stutter
+        for cam_name in segment.frame_readers:
+          self._camera_server.warm_cache(segment.frame_readers[cam_name])
 
     # Initialize timeline
     self._timeline.initialize(
@@ -331,10 +362,17 @@ class Replay:
       lambda lr: self.on_qlog_loaded(lr) if self.on_qlog_loaded else None
     )
 
+    if self.has_flag(ReplayFlags.BENCHMARK):
+      self._benchmark_stats.record("streaming started")
+
     self._stream_thread = threading.Thread(target=self._stream_thread_fn, daemon=True)
     self._stream_thread.start()
 
   def _stream_thread_fn(self) -> None:
+    benchmark_mode = self.has_flag(ReplayFlags.BENCHMARK)
+    benchmark_segment_start: Optional[float] = None
+    benchmark_start_segment = self._current_segment
+
     while True:
       # Hold lock only while checking/updating shared state
       with self._stream_lock:
@@ -356,12 +394,32 @@ class Replay:
           self._events_ready = False
           continue
 
+      if benchmark_mode and benchmark_segment_start is None:
+        benchmark_segment_start = time.monotonic()
+
       # Publish WITHOUT holding lock - allows UI to interrupt quickly
+      prev_segment = self._current_segment
       last_idx = self._publish_events(events, first_idx)
 
       # Wait for camera frames to be sent
       if self._camera_server:
         self._camera_server.wait_for_sent()
+
+      # Track segment completion for benchmark
+      if benchmark_mode and self._current_segment != prev_segment:
+        elapsed_ms = (time.monotonic() - benchmark_segment_start) * 1000
+        realtime_ms = 60 * 1000  # 60 seconds per segment
+        multiplier = realtime_ms / elapsed_ms if elapsed_ms > 0 else 0
+        self._benchmark_stats.record(f"segment {prev_segment} done publishing ({elapsed_ms:.0f} ms, {multiplier:.0f}x realtime)")
+        benchmark_segment_start = time.monotonic()
+
+        # In benchmark mode, exit after first segment
+        if prev_segment == benchmark_start_segment:
+          self._benchmark_stats.record("benchmark done")
+          with self._benchmark_cv:
+            self._benchmark_done = True
+            self._benchmark_cv.notify_all()
+          break
 
       # Handle loop
       if last_idx >= len(events) and not self.has_flag(ReplayFlags.NO_LOOP):
@@ -374,6 +432,7 @@ class Replay:
     evt_start_ts = self._cur_mono_time
     loop_start_ts = time.monotonic_ns()
     prev_speed = self._speed
+    benchmark_mode = self.has_flag(ReplayFlags.BENCHMARK)
 
     idx = first_idx
     while idx < len(events) and not self._interrupt.is_set():
@@ -384,6 +443,9 @@ class Replay:
       if self._current_segment != segment:
         self._current_segment = segment
         self._seg_mgr.set_current_segment(segment)
+        # In benchmark mode, return after segment change to allow tracking
+        if benchmark_mode:
+          return idx
 
       self._cur_mono_time = evt.logMonoTime
 
@@ -393,26 +455,28 @@ class Replay:
         idx += 1
         continue
 
-      # Timing
-      current_nanos = time.monotonic_ns()
-      time_diff = (evt.logMonoTime - evt_start_ts) / self._speed - (current_nanos - loop_start_ts)
+      # Skip timing in benchmark mode for maximum throughput
+      if not benchmark_mode:
+        # Timing
+        current_nanos = time.monotonic_ns()
+        time_diff = (evt.logMonoTime - evt_start_ts) / self._speed - (current_nanos - loop_start_ts)
 
-      # Record timing stats for observability
-      self._stats.record_timing(int(time_diff))
+        # Record timing stats for observability
+        self._stats.record_timing(int(time_diff))
 
-      # Reset timing if needed
-      if time_diff < -1e9 or time_diff >= 1e9 or self._speed != prev_speed:
-        evt_start_ts = evt.logMonoTime
-        loop_start_ts = current_nanos
-        prev_speed = self._speed
-      elif time_diff > 0:
-        # Interruptible sleep
-        wait_secs = time_diff / 1e9
-        if self._interrupt.wait(timeout=wait_secs):
-          break  # Interrupted
+        # Reset timing if needed
+        if time_diff < -1e9 or time_diff >= 1e9 or self._speed != prev_speed:
+          evt_start_ts = evt.logMonoTime
+          loop_start_ts = current_nanos
+          prev_speed = self._speed
+        elif time_diff > 0:
+          # Interruptible sleep
+          wait_secs = time_diff / 1e9
+          if self._interrupt.wait(timeout=wait_secs):
+            break  # Interrupted
 
-      if self._interrupt.is_set():
-        break
+        if self._interrupt.is_set():
+          break
 
       # Publish message or frame
       if which in ('roadEncodeIdx', 'driverEncodeIdx', 'wideRoadEncodeIdx'):
@@ -497,6 +561,7 @@ def main():
   parser.add_argument('--qcam', action='store_true', help='Load qcamera')
   parser.add_argument('--no-vipc', action='store_true', help='Do not output video')
   parser.add_argument('--all', action='store_true', help='Output all messages')
+  parser.add_argument('--benchmark', action='store_true', help='Run in benchmark mode (process all events then exit with stats)')
   parser.add_argument('--headless', action='store_true', help='Run without UI')
 
   args = parser.parse_args()
@@ -523,6 +588,8 @@ def main():
     flags |= ReplayFlags.NO_VIPC
   if args.all:
     flags |= ReplayFlags.ALL_SERVICES
+  if args.benchmark:
+    flags |= ReplayFlags.BENCHMARK
 
   # Parse allow/block lists
   allow = [s.strip() for s in args.allow.split(',') if s.strip()]
@@ -550,6 +617,24 @@ def main():
 
   if not replay.load():
     return 1
+
+  if args.benchmark:
+    replay.start(args.start)
+    replay.wait_for_finished()
+
+    stats = replay.benchmark_stats
+    process_start = stats.process_start_ts
+
+    print("\n===== REPLAY BENCHMARK RESULTS =====")
+    print(f"Route: {replay.route.name}")
+    print("\nTIMELINE:")
+    print("  t=0 ms        process start")
+    for ts, event in stats.timeline:
+      ms = (ts - process_start) / 1e6
+      padding = " " * max(1, 8 - len(str(int(ms))))
+      print(f"  t={ms:.0f} ms{padding}{event}")
+
+    return 0
 
   replay.start(args.start)
 

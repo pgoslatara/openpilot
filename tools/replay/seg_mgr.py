@@ -23,6 +23,7 @@ class ReplayFlags(IntFlag):
   QCAMERA = 0x0040
   NO_VIPC = 0x0400
   ALL_SERVICES = 0x0800
+  BENCHMARK = 0x1000
 
 
 class LoadState(Enum):
@@ -224,18 +225,19 @@ class SegmentManager:
     # Load frame readers based on flags
     # VisionIPC expects NV12 format
     try:
+      # cache_size=90 holds 3 GOPs (30 frames each) to stay ahead at 8x speed
       if segment.camera_path and not (self._flags & ReplayFlags.NO_VIPC):
         if not (self._flags & ReplayFlags.QCAMERA):
-          seg_data.frame_readers['road'] = FrameReader(segment.camera_path, pix_fmt='nv12')
+          seg_data.frame_readers['road'] = FrameReader(segment.camera_path, pix_fmt='nv12', cache_size=90)
 
       if segment.dcamera_path and (self._flags & ReplayFlags.DCAM):
-        seg_data.frame_readers['driver'] = FrameReader(segment.dcamera_path, pix_fmt='nv12')
+        seg_data.frame_readers['driver'] = FrameReader(segment.dcamera_path, pix_fmt='nv12', cache_size=90)
 
       if segment.ecamera_path and (self._flags & ReplayFlags.ECAM):
-        seg_data.frame_readers['wide'] = FrameReader(segment.ecamera_path, pix_fmt='nv12')
+        seg_data.frame_readers['wide'] = FrameReader(segment.ecamera_path, pix_fmt='nv12', cache_size=90)
 
       if segment.qcamera_path and (self._flags & ReplayFlags.QCAMERA):
-        seg_data.frame_readers['qcam'] = FrameReader(segment.qcamera_path, pix_fmt='nv12')
+        seg_data.frame_readers['qcam'] = FrameReader(segment.qcamera_path, pix_fmt='nv12', cache_size=90)
     except Exception as e:
       log.warning(f"failed to load frames for segment {seg_num}: {e}")
       # Don't fail the whole segment, just skip frames
