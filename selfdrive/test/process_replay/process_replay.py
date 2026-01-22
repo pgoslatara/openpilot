@@ -206,8 +206,7 @@ class ProcessContainer:
         assert frs[meta.camera_state].pix_fmt == 'nv12'
         frame_size = (frs[meta.camera_state].w, frs[meta.camera_state].h)
         stride, y_height, _, yuv_size = get_nv12_info(frame_size[0], frame_size[1])
-        uv_offset = stride * y_height
-        vipc_server.create_buffers_with_sizes(meta.stream, 2, frame_size[0], frame_size[1], yuv_size, stride, uv_offset)
+        vipc_server.create_buffers_with_sizes(meta.stream, 2, frame_size[0], frame_size[1], yuv_size, stride, stride * y_height)
     vipc_server.start_listener()
 
     self.vipc_server = vipc_server
