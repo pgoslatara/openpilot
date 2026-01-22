@@ -38,11 +38,8 @@ VISION_PKL_PATH = Path(__file__).parent / 'models/driving_vision_tinygrad.pkl'
 POLICY_PKL_PATH = Path(__file__).parent / 'models/driving_policy_tinygrad.pkl'
 VISION_METADATA_PATH = Path(__file__).parent / 'models/driving_vision_metadata.pkl'
 POLICY_METADATA_PATH = Path(__file__).parent / 'models/driving_policy_metadata.pkl'
-MODELS_DIR = Path(__file__).parent / 'models'
 
-
-def get_warp_pkl_path(width: int, height: int) -> Path:
-  return MODELS_DIR / f'warp_{width}x{height}.pkl'
+WARP_PKL_PATH = Path(__file__).parent / 'models/warp_tinygrad.pkl'
 
 LAT_SMOOTH_SECONDS = 0.0
 LONG_SMOOTH_SECONDS = 0.3
@@ -182,13 +179,15 @@ class ModelState:
     self.parser = Parser()
     self.frame_init = False
     self.frame_buf_params : dict[str, tuple[int, int, int, int]] = {}
-    self.update_imgs = None
 
     with open(VISION_PKL_PATH, "rb") as f:
       self.vision_run = pickle.load(f)
 
     with open(POLICY_PKL_PATH, "rb") as f:
       self.policy_run = pickle.load(f)
+
+    with open(WARP_PKL_PATH, "rb") as f:
+      self.update_imgs = pickle.load(f)
 
   def slice_outputs(self, model_outputs: np.ndarray, output_slices: dict[str, slice]) -> dict[str, np.ndarray]:
     parsed_model_outputs = {k: model_outputs[np.newaxis, v] for k,v in output_slices.items()}
@@ -204,9 +203,6 @@ class ModelState:
       for key in bufs.keys():
         w, h = bufs[key].width, bufs[key].height
         self.frame_buf_params[key] = get_nv12_info(w, h)
-      # Load warp for this camera resolution
-      with open(get_warp_pkl_path(w, h), "rb") as f:
-        self.update_imgs = pickle.load(f)
       self.frame_init = True
 
 

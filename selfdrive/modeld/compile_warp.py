@@ -7,36 +7,22 @@ from tinygrad.tensor import Tensor
 from tinygrad.helpers import Context
 from tinygrad.device import Device
 from openpilot.system.camerad.cameras.nv12_info import get_nv12_info
-from openpilot.common.transformations.model import MEDMODEL_INPUT_SIZE, DM_INPUT_SIZE
-from openpilot.common.transformations.camera import _ar_ox_config, _os_config
-from openpilot.selfdrive.modeld.constants import ModelConstants
 
 
-MODELS_DIR = Path(__file__).parent / 'models'
+WARP_PKL_PATH = Path(__file__).parent / 'models/warp_tinygrad.pkl'
+DM_WARP_PKL_PATH = Path(__file__).parent / 'models/dm_warp_tinygrad.pkl'
 
-# Model input sizes from common/transformations/model.py
-MODEL_WIDTH, MODEL_HEIGHT = MEDMODEL_INPUT_SIZE
-DM_WIDTH, DM_HEIGHT = DM_INPUT_SIZE
+MODEL_WIDTH = 512
+MODEL_HEIGHT = 256
+MODEL_FRAME_SIZE = MODEL_WIDTH * MODEL_HEIGHT * 3 // 2
+IMG_BUFFER_SHAPE = (30, 128, 256)
+W, H = 1928, 1208
 
-# Image buffer shape for modeld
-IMG_BUFFER_SHAPE = (6 * (ModelConstants.MODEL_RUN_FREQ // ModelConstants.MODEL_CONTEXT_FREQ + 1), MODEL_HEIGHT // 2, MODEL_WIDTH // 2)
-
-# Camera configurations to compile warps for
-CAMERA_CONFIGS = {
-  'ar_ox': _ar_ox_config.fcam,  # tici/tizi: 1928x1208
-  'os': _os_config.fcam,        # mici: 1344x760
-}
+STRIDE, Y_HEIGHT, _, YUV_SIZE = get_nv12_info(W, H)
+UV_OFFSET = STRIDE * Y_HEIGHT
 
 UV_SCALE_MATRIX = np.array([[0.5, 0, 0], [0, 0.5, 0], [0, 0, 1]], dtype=np.float32)
 UV_SCALE_MATRIX_INV = np.linalg.inv(UV_SCALE_MATRIX)
-
-
-def get_warp_pkl_path(cam_width: int, cam_height: int) -> Path:
-  return MODELS_DIR / f'warp_{cam_width}x{cam_height}.pkl'
-
-
-def get_dm_warp_pkl_path(cam_width: int, cam_height: int) -> Path:
-  return MODELS_DIR / f'dm_warp_{cam_width}x{cam_height}.pkl'
 
 
 def warp_perspective_tinygrad(src_flat, M_inv, dst_shape, src_shape, stride_pad, ratio):
@@ -58,7 +44,6 @@ def warp_perspective_tinygrad(src_flat, M_inv, dst_shape, src_shape, stride_pad,
   sampled = src_flat[idx]
   return sampled
 
-
 def frames_to_tensor(frames):
   H = (frames.shape[0]*2)//3
   W = frames.shape[1]
@@ -70,97 +55,111 @@ def frames_to_tensor(frames):
                         frames[H+H//4:H+H//2].reshape((H//2,W//2)), dim=0).reshape((6, H//2, W//2))
   return in_img1
 
+def frame_prepare_tinygrad(input_frame, M_inv):
+  tg_scale = Tensor(UV_SCALE_MATRIX)
+  M_inv_uv = tg_scale @ M_inv @ Tensor(UV_SCALE_MATRIX_INV)
+  with Context(SPLIT_REDUCEOP=0):
+    y = warp_perspective_tinygrad(input_frame[:H*STRIDE],
+                                  M_inv, (MODEL_WIDTH, MODEL_HEIGHT),
+                                  (H, W), STRIDE - W, 1).realize()
+    u = warp_perspective_tinygrad(input_frame[UV_OFFSET:UV_OFFSET + (H//4)*STRIDE],
+                                  M_inv_uv, (MODEL_WIDTH//2, MODEL_HEIGHT//2),
+                                  (H//2, W//2), STRIDE - W, 0.5).realize()
+    v = warp_perspective_tinygrad(input_frame[UV_OFFSET + (H//4)*STRIDE:UV_OFFSET + (H//2)*STRIDE],
+                                  M_inv_uv, (MODEL_WIDTH//2, MODEL_HEIGHT//2),
+                                  (H//2, W//2), STRIDE - W, 0.5).realize()
+  yuv = y.cat(u).cat(v).reshape((MODEL_HEIGHT*3//2,MODEL_WIDTH))
+  tensor = frames_to_tensor(yuv)
+  return tensor
 
-def make_frame_prepare_tinygrad(cam_width: int, cam_height: int):
-  """Create a frame_prepare function for a specific camera resolution."""
-  stride, y_height, _, _ = get_nv12_info(cam_width, cam_height)
-  uv_offset = stride * y_height
+def update_img_input_tinygrad(tensor, frame, M_inv):
+  M_inv = M_inv.to(Device.DEFAULT)
+  new_img = frame_prepare_tinygrad(frame, M_inv)
+  full_buffer = tensor[6:].cat(new_img, dim=0).contiguous()
+  return full_buffer, Tensor.cat(full_buffer[:6], full_buffer[-6:], dim=0).contiguous().reshape(1,12,MODEL_HEIGHT//2,MODEL_WIDTH//2)
 
-  def frame_prepare_tinygrad(input_frame, M_inv):
-    tg_scale = Tensor(UV_SCALE_MATRIX)
-    M_inv_uv = tg_scale @ M_inv @ Tensor(UV_SCALE_MATRIX_INV)
-    with Context(SPLIT_REDUCEOP=0):
-      y = warp_perspective_tinygrad(input_frame[:cam_height*stride],
-                                    M_inv, (MODEL_WIDTH, MODEL_HEIGHT),
-                                    (cam_height, cam_width), stride - cam_width, 1).realize()
-      u = warp_perspective_tinygrad(input_frame[uv_offset:uv_offset + (cam_height//4)*stride],
-                                    M_inv_uv, (MODEL_WIDTH//2, MODEL_HEIGHT//2),
-                                    (cam_height//2, cam_width//2), stride - cam_width, 0.5).realize()
-      v = warp_perspective_tinygrad(input_frame[uv_offset + (cam_height//4)*stride:uv_offset + (cam_height//2)*stride],
-                                    M_inv_uv, (MODEL_WIDTH//2, MODEL_HEIGHT//2),
-                                    (cam_height//2, cam_width//2), stride - cam_width, 0.5).realize()
-    yuv = y.cat(u).cat(v).reshape((MODEL_HEIGHT*3//2, MODEL_WIDTH))
-    tensor = frames_to_tensor(yuv)
-    return tensor
+def update_both_imgs_tinygrad(calib_img_buffer, new_img, M_inv,
+                              calib_big_img_buffer, new_big_img, M_inv_big):
+  calib_img_buffer, calib_img_pair = update_img_input_tinygrad(calib_img_buffer, new_img, M_inv)
+  calib_big_img_buffer, calib_big_img_pair = update_img_input_tinygrad(calib_big_img_buffer, new_big_img, M_inv_big)
+  return calib_img_buffer, calib_img_pair, calib_big_img_buffer, calib_big_img_pair
 
-  return frame_prepare_tinygrad
+def warp_perspective_numpy(src, M_inv, dst_shape, src_shape, stride_pad, ratio):
+    w_dst, h_dst = dst_shape
+    h_src, w_src = src_shape
+    xs, ys = np.meshgrid(np.arange(w_dst), np.arange(h_dst))
 
+    ones = np.ones_like(xs)
+    dst_hom = np.stack([xs, ys, ones], axis=0).reshape(3, -1)
 
-def make_update_img_input_tinygrad(frame_prepare_fn):
-  """Create an update_img_input function with a specific frame_prepare function."""
-  def update_img_input_tinygrad(tensor, frame, M_inv):
-    M_inv = M_inv.to(Device.DEFAULT)
-    new_img = frame_prepare_fn(frame, M_inv)
-    full_buffer = tensor[6:].cat(new_img, dim=0).contiguous()
-    return full_buffer, Tensor.cat(full_buffer[:6], full_buffer[-6:], dim=0).contiguous().reshape(1, 12, MODEL_HEIGHT//2, MODEL_WIDTH//2)
+    src_hom = M_inv @ dst_hom
+    src_hom /= src_hom[2:3, :]
 
-  return update_img_input_tinygrad
-
-
-def make_update_both_imgs_tinygrad(frame_prepare_fn):
-  """Create the update_both_imgs function for a specific camera resolution."""
-  update_img_fn = make_update_img_input_tinygrad(frame_prepare_fn)
-
-  def update_both_imgs_tinygrad(calib_img_buffer, new_img, M_inv,
-                                calib_big_img_buffer, new_big_img, M_inv_big):
-    calib_img_buffer, calib_img_pair = update_img_fn(calib_img_buffer, new_img, M_inv)
-    calib_big_img_buffer, calib_big_img_pair = update_img_fn(calib_big_img_buffer, new_big_img, M_inv_big)
-    return calib_img_buffer, calib_img_pair, calib_big_img_buffer, calib_big_img_pair
-
-  return update_both_imgs_tinygrad
+    src_x = np.clip(np.round(src_hom[0, :]).astype(int), 0, w_src - 1)
+    src_y = np.clip(np.round(src_hom[1, :]).astype(int), 0, h_src - 1)
+    idx = src_y * w_src + (src_y * ratio).astype(np.int32) * stride_pad + src_x
+    return src[idx]
 
 
-def make_dm_warp_tinygrad(cam_width: int, cam_height: int):
-  """Create a DM warp function for a specific camera resolution."""
-  stride, y_height, _, _ = get_nv12_info(cam_width, cam_height)
+def frames_to_tensor_np(frames):
+  H = (frames.shape[0]*2)//3
+  W = frames.shape[1]
+  p1 = frames[0:H:2, 0::2]
+  p2 = frames[1:H:2, 0::2]
+  p3 = frames[0:H:2, 1::2]
+  p4 = frames[1:H:2, 1::2]
+  p5 = frames[H:H+H//4].reshape((H//2, W//2))
+  p6 = frames[H+H//4:H+H//2].reshape((H//2, W//2))
+  return np.concatenate([p1, p2, p3, p4, p5, p6], axis=0)\
+           .reshape((6, H//2, W//2))
 
-  def warp_dm(input_frame, M_inv):
-    M_inv = M_inv.to(Device.DEFAULT)
-    with Context(SPLIT_REDUCEOP=0):
-      result = warp_perspective_tinygrad(input_frame[:cam_height*stride], M_inv, (DM_WIDTH, DM_HEIGHT),
-                                         (cam_height, cam_width), stride - cam_width, 1).reshape(-1, DM_HEIGHT * DM_WIDTH)
-    return result
+def frame_prepare_np(input_frame, M_inv):
+  M_inv_uv = UV_SCALE_MATRIX @ M_inv @ UV_SCALE_MATRIX_INV
+  y  = warp_perspective_numpy(input_frame[:H*STRIDE],
+                                 M_inv, (MODEL_WIDTH, MODEL_HEIGHT), (H, W), STRIDE - W, 1)
+  u  = warp_perspective_numpy(input_frame[UV_OFFSET:UV_OFFSET + (H//4)*STRIDE],
+                                 M_inv_uv, (MODEL_WIDTH//2, MODEL_HEIGHT//2), (H//2, W//2), STRIDE - W, 0.5)
+  v  = warp_perspective_numpy(input_frame[UV_OFFSET + (H//4)*STRIDE:UV_OFFSET + (H//2)*STRIDE],
+                                 M_inv_uv, (MODEL_WIDTH//2, MODEL_HEIGHT//2), (H//2, W//2), STRIDE - W, 0.5)
+  yuv = np.concatenate([y, u, v]).reshape( MODEL_HEIGHT*3//2, MODEL_WIDTH)
+  return frames_to_tensor_np(yuv)
 
-  return warp_dm
+def update_img_input_np(tensor, frame, M_inv):
+  tensor[:-6]  = tensor[6:]
+  tensor[-6:] = frame_prepare_np(frame, M_inv)
+  return tensor, np.concatenate([tensor[:6], tensor[-6:]], axis=0).reshape((1,12,MODEL_HEIGHT//2, MODEL_WIDTH//2))
 
+def update_both_imgs_np(calib_img_buffer, new_img, M_inv,
+                        calib_big_img_buffer, new_big_img, M_inv_big):
+  calib_img_buffer, calib_img_pair = update_img_input_np(calib_img_buffer, new_img, M_inv)
+  calib_big_img_buffer, calib_big_img_pair = update_img_input_np(calib_big_img_buffer, new_big_img, M_inv_big)
+  return calib_img_buffer, calib_img_pair, calib_big_img_buffer, calib_big_img_pair
 
-def compile_warp_for_camera(cam_width: int, cam_height: int):
-  """Compile and save warp pickle for a specific camera resolution."""
+def run_and_save_pickle():
   from tinygrad.engine.jit import TinyJit
-
-  print(f"\n=== Compiling modeld warp for {cam_width}x{cam_height} ===")
-
-  _, _, _, yuv_size = get_nv12_info(cam_width, cam_height)
-
-  frame_prepare_fn = make_frame_prepare_tinygrad(cam_width, cam_height)
-  update_both_imgs_fn = make_update_both_imgs_tinygrad(frame_prepare_fn)
-  update_img_jit = TinyJit(update_both_imgs_fn, prune=True)
+  from tinygrad.device import Device
+  update_img_jit = TinyJit(update_both_imgs_tinygrad, prune=True)
 
   full_buffer = Tensor.zeros(IMG_BUFFER_SHAPE, dtype='uint8').contiguous().realize()
   big_full_buffer = Tensor.zeros(IMG_BUFFER_SHAPE, dtype='uint8').contiguous().realize()
+  full_buffer_np = np.zeros(IMG_BUFFER_SHAPE, dtype=np.uint8)
+  big_full_buffer_np = np.zeros(IMG_BUFFER_SHAPE, dtype=np.uint8)
 
   step_times = []
-  for i in range(10):
-    new_frame_np = (32*np.random.randn(yuv_size).astype(np.float32) + 128).clip(0, 255).astype(np.uint8)
+  for _ in range(10):
+    new_frame_np = (32*np.random.randn(YUV_SIZE).astype(np.float32) + 128).clip(0,255).astype(np.uint8)
     img_inputs = [full_buffer,
-                  Tensor.from_blob(new_frame_np.ctypes.data, (yuv_size,), dtype='uint8').realize(),
-                  Tensor(Tensor.randn(3, 3).mul(8).realize().numpy(), device='NPY')]
-    new_big_frame_np = (32*np.random.randn(yuv_size).astype(np.float32) + 128).clip(0, 255).astype(np.uint8)
+                  Tensor.from_blob(new_frame_np.ctypes.data, (YUV_SIZE,), dtype='uint8').realize(),
+                  Tensor(Tensor.randn(3,3).mul(8).realize().numpy(), device='NPY')]
+    new_big_frame_np = (32*np.random.randn(YUV_SIZE).astype(np.float32) + 128).clip(0,255).astype(np.uint8)
     big_img_inputs = [big_full_buffer,
-                      Tensor.from_blob(new_big_frame_np.ctypes.data, (yuv_size,), dtype='uint8').realize(),
-                      Tensor(Tensor.randn(3, 3).mul(8).realize().numpy(), device='NPY')]
+                      Tensor.from_blob(new_big_frame_np.ctypes.data, (YUV_SIZE,), dtype='uint8').realize(),
+                      Tensor(Tensor.randn(3,3).mul(8).realize().numpy(), device='NPY')]
     inputs = img_inputs + big_img_inputs
     Device.default.synchronize()
+    inputs_np = [x.numpy() for x in inputs]
+    inputs_np[0] = full_buffer_np
+    inputs_np[3] = big_full_buffer_np
     st = time.perf_counter()
     out = update_img_jit(*inputs)
     full_buffer = out[0].contiguous().realize().clone()
@@ -169,34 +168,36 @@ def compile_warp_for_camera(cam_width: int, cam_height: int):
     Device.default.synchronize()
     et = time.perf_counter()
     step_times.append((et-st)*1e3)
-    print(f"  iter {i}: enqueue {(mt-st)*1e3:6.2f} ms -- total run {step_times[-1]:6.2f} ms")
+    print(f"enqueue {(mt-st)*1e3:6.2f} ms -- total run {step_times[-1]:6.2f} ms")
+    out_np = update_both_imgs_np(*inputs_np)
+    full_buffer_np = out_np[0]
+    big_full_buffer_np = out_np[2]
 
-  pkl_path = get_warp_pkl_path(cam_width, cam_height)
-  with open(pkl_path, "wb") as f:
+    # TODO REACTIVATE
+    #for a, b in zip(out_np, (x.numpy() for x in out), strict=True):
+    #  mismatch = np.abs(a - b) > 0
+    #  mismatch_percent = sum(mismatch.flatten()) / len(mismatch.flatten()) * 100
+    #  mismatch_percent_tol = 1e-2
+    #  assert mismatch_percent < mismatch_percent_tol, f"input mismatch percent {mismatch_percent} exceeds tolerance {mismatch_percent_tol}"
+
+  with open(WARP_PKL_PATH, "wb") as f:
     pickle.dump(update_img_jit, f)
-  print(f"  Saved to {pkl_path}")
 
-  # Verify loaded pickle works
-  jit = pickle.load(open(pkl_path, "rb"))
+  jit = pickle.load(open(WARP_PKL_PATH, "rb"))
+  # test function after loading
   jit(*inputs)
-  print(f"  Verified pickle loads correctly")
 
 
-def compile_dm_warp_for_camera(cam_width: int, cam_height: int):
-  """Compile and save DM warp pickle for a specific camera resolution."""
-  from tinygrad.engine.jit import TinyJit
-
-  print(f"\n=== Compiling DM warp for {cam_width}x{cam_height} ===")
-
-  _, _, _, yuv_size = get_nv12_info(cam_width, cam_height)
-
-  warp_dm_fn = make_dm_warp_tinygrad(cam_width, cam_height)
-  warp_dm_jit = TinyJit(warp_dm_fn, prune=True)
-
+  def warp_dm(input_frame, M_inv):
+    M_inv = M_inv.to(Device.DEFAULT)
+    with Context(SPLIT_REDUCEOP=0):
+      result = warp_perspective_tinygrad(input_frame[:H*STRIDE], M_inv, (1440, 960), (H, W), STRIDE - W, 1).reshape(-1,960*1440)
+    return result
+  warp_dm_jit = TinyJit(warp_dm, prune=True)
   step_times = []
-  for i in range(10):
-    inputs = [Tensor.from_blob((32*Tensor.randn(yuv_size,) + 128).cast(dtype='uint8').realize().numpy().ctypes.data, (yuv_size,), dtype='uint8'),
-              Tensor(Tensor.randn(3, 3).mul(8).realize().numpy(), device='NPY')]
+  for _ in range(10):
+    inputs = [Tensor.from_blob((32*Tensor.randn(YUV_SIZE,) + 128).cast(dtype='uint8').realize().numpy().ctypes.data, (YUV_SIZE,), dtype='uint8'),
+                  Tensor(Tensor.randn(3,3).mul(8).realize().numpy(), device='NPY')]
 
     Device.default.synchronize()
     st = time.perf_counter()
@@ -205,21 +206,10 @@ def compile_dm_warp_for_camera(cam_width: int, cam_height: int):
     Device.default.synchronize()
     et = time.perf_counter()
     step_times.append((et-st)*1e3)
-    print(f"  iter {i}: enqueue {(mt-st)*1e3:6.2f} ms -- total run {step_times[-1]:6.2f} ms")
+    print(f"enqueue {(mt-st)*1e3:6.2f} ms -- total run {step_times[-1]:6.2f} ms")
 
-  pkl_path = get_dm_warp_pkl_path(cam_width, cam_height)
-  with open(pkl_path, "wb") as f:
+  with open(DM_WARP_PKL_PATH, "wb") as f:
     pickle.dump(warp_dm_jit, f)
-  print(f"  Saved to {pkl_path}")
-
-
-def run_and_save_pickle():
-  """Compile warps for all supported camera configurations."""
-  for name, cam in CAMERA_CONFIGS.items():
-    print(f"\nProcessing camera config: {name} ({cam.width}x{cam.height})")
-    compile_warp_for_camera(cam.width, cam.height)
-    compile_dm_warp_for_camera(cam.width, cam.height)
-
 
 if __name__ == "__main__":
-  run_and_save_pickle()
+    run_and_save_pickle()

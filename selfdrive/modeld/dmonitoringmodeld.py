@@ -23,11 +23,7 @@ PROCESS_NAME = "selfdrive.modeld.dmonitoringmodeld"
 SEND_RAW_PRED = os.getenv('SEND_RAW_PRED')
 MODEL_PKL_PATH = Path(__file__).parent / 'models/dmonitoring_model_tinygrad.pkl'
 METADATA_PATH = Path(__file__).parent / 'models/dmonitoring_model_metadata.pkl'
-MODELS_DIR = Path(__file__).parent / 'models'
-
-
-def get_dm_warp_pkl_path(width: int, height: int) -> Path:
-  return MODELS_DIR / f'dm_warp_{width}x{height}.pkl'
+DM_WARP_PKL_PATH = Path(__file__).parent / 'models/dm_warp_tinygrad.pkl'
 
 class ModelState:
   inputs: dict[str, np.ndarray]
@@ -46,10 +42,12 @@ class ModelState:
     self.warp_inputs_np = {'transform': np.zeros((3,3), dtype=np.float32)}
     self.warp_inputs = {k: Tensor(v, device='NPY') for k,v in self.warp_inputs_np.items()}
     self.frame_buf_params = None
-    self.image_warp = None
     self.tensor_inputs = {k: Tensor(v, device='NPY').realize() for k,v in self.numpy_inputs.items()}
     with open(MODEL_PKL_PATH, "rb") as f:
       self.model_run = pickle.load(f)
+
+    with open(DM_WARP_PKL_PATH, "rb") as f:
+      self.image_warp = pickle.load(f)
 
   def run(self, buf: VisionBuf, calib: np.ndarray, transform: np.ndarray) -> tuple[np.ndarray, float]:
     self.numpy_inputs['calib'][0,:] = calib
@@ -58,9 +56,6 @@ class ModelState:
 
     if self.frame_buf_params is None:
       self.frame_buf_params = get_nv12_info(buf.width, buf.height)
-      # Load DM warp for this camera resolution
-      with open(get_dm_warp_pkl_path(buf.width, buf.height), "rb") as f:
-        self.image_warp = pickle.load(f)
     self.warp_inputs['frame'] = Tensor.from_blob(buf.data.ctypes.data, (self.frame_buf_params[3],), dtype='uint8').realize()
 
     self.warp_inputs_np['transform'][:] = transform[:]
