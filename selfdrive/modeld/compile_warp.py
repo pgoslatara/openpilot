@@ -173,12 +173,11 @@ def run_and_save_pickle():
     full_buffer_np = out_np[0]
     big_full_buffer_np = out_np[2]
 
-    # TODO REACTIVATE
-    #for a, b in zip(out_np, (x.numpy() for x in out), strict=True):
-    #  mismatch = np.abs(a - b) > 0
-    #  mismatch_percent = sum(mismatch.flatten()) / len(mismatch.flatten()) * 100
-    #  mismatch_percent_tol = 1e-2
-    #  assert mismatch_percent < mismatch_percent_tol, f"input mismatch percent {mismatch_percent} exceeds tolerance {mismatch_percent_tol}"
+    for a, b in zip(out_np, (x.numpy() for x in out), strict=True):
+      mismatch = np.abs(a - b) > 0
+      mismatch_percent = sum(mismatch.flatten()) / len(mismatch.flatten()) * 100
+      mismatch_percent_tol = 1e-2
+      assert mismatch_percent < mismatch_percent_tol, f"input mismatch percent {mismatch_percent} exceeds tolerance {mismatch_percent_tol}"
 
   with open(WARP_PKL_PATH, "wb") as f:
     pickle.dump(update_img_jit, f)
