@@ -6,7 +6,7 @@ from pathlib import Path
 from tinygrad.tensor import Tensor
 from tinygrad.helpers import Context
 from tinygrad.device import Device
-from openpilot.common.transformations.camera import get_nv12_info
+from openpilot.system.camerad.cameras.nv12_info import get_nv12_info
 
 
 WARP_PKL_PATH = Path(__file__).parent / 'models/warp_tinygrad.pkl'
@@ -18,7 +18,8 @@ MODEL_FRAME_SIZE = MODEL_WIDTH * MODEL_HEIGHT * 3 // 2
 IMG_BUFFER_SHAPE = (30, 128, 256)
 W, H = 1928, 1208
 
-YUV_SIZE, STRIDE, UV_OFFSET = get_nv12_info(W, H)
+STRIDE, Y_HEIGHT, _, YUV_SIZE = get_nv12_info(W, H)
+UV_OFFSET = STRIDE * Y_HEIGHT
 
 UV_SCALE_MATRIX = np.array([[0.5, 0, 0], [0, 0.5, 0], [0, 0, 1]], dtype=np.float32)
 UV_SCALE_MATRIX_INV = np.linalg.inv(UV_SCALE_MATRIX)

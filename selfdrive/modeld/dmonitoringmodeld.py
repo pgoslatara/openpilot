@@ -15,7 +15,8 @@ from msgq.visionipc.visionipc_pyx import CLContext
 from openpilot.common.swaglog import cloudlog
 from openpilot.common.realtime import config_realtime_process
 from openpilot.common.transformations.model import dmonitoringmodel_intrinsics
-from openpilot.common.transformations.camera import _ar_ox_fisheye, _os_fisheye, get_nv12_info
+from openpilot.common.transformations.camera import _ar_ox_fisheye, _os_fisheye
+from openpilot.system.camerad.cameras.nv12_info import get_nv12_info
 from openpilot.selfdrive.modeld.parse_model_outputs import sigmoid, safe_exp
 
 PROCESS_NAME = "selfdrive.modeld.dmonitoringmodeld"
@@ -55,7 +56,7 @@ class ModelState:
 
     if self.frame_buf_params is None:
       self.frame_buf_params = get_nv12_info(buf.width, buf.height)
-    self.warp_inputs['frame'] = Tensor.from_blob(buf.data.ctypes.data, (self.frame_buf_params[0],), dtype='uint8').realize()
+    self.warp_inputs['frame'] = Tensor.from_blob(buf.data.ctypes.data, (self.frame_buf_params[3],), dtype='uint8').realize()
 
     self.warp_inputs_np['transform'][:] = transform[:]
     self.tensor_inputs['input_img'] = self.image_warp(self.warp_inputs['frame'], self.warp_inputs['transform']).realize()

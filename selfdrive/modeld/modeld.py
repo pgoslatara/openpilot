@@ -21,7 +21,8 @@ from openpilot.common.swaglog import cloudlog
 from openpilot.common.params import Params
 from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.realtime import config_realtime_process, DT_MDL
-from openpilot.common.transformations.camera import DEVICE_CAMERAS, get_nv12_info
+from openpilot.common.transformations.camera import DEVICE_CAMERAS
+from openpilot.system.camerad.cameras.nv12_info import get_nv12_info
 from openpilot.common.transformations.model import get_warp_matrix
 from openpilot.selfdrive.controls.lib.desire_helper import DesireHelper
 from openpilot.selfdrive.controls.lib.drive_helpers import get_accel_from_plan, smooth_value, get_curvature_from_plan
@@ -178,7 +179,7 @@ class ModelState:
     self.policy_output = np.zeros(policy_output_size, dtype=np.float32)
     self.parser = Parser()
     self.frame_init = False
-    self.frame_buf_params : dict[str, tuple[int, int, int]] = {}
+    self.frame_buf_params : dict[str, tuple[int, int, int, int]] = {}
 
     with open(VISION_PKL_PATH, "rb") as f:
       self.vision_run = pickle.load(f)
@@ -208,7 +209,7 @@ class ModelState:
 
     for key in bufs.keys():
       if key not in self.full_frames:
-        self.full_frames[key] = Tensor.from_blob(bufs[key].data.ctypes.data, (self.frame_buf_params[key][0],), dtype='uint8').realize()
+        self.full_frames[key] = Tensor.from_blob(bufs[key].data.ctypes.data, (self.frame_buf_params[key][3],), dtype='uint8').realize()
       self.transforms_np[key][:,:] = transforms[key][:,:]
 
     out = self.update_imgs(self.img_queues['img'], self.full_frames['img'], self.transforms['img'],
