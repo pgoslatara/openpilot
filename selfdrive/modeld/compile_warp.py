@@ -18,10 +18,9 @@ MODEL_WIDTH, MODEL_HEIGHT = MEDMODEL_INPUT_SIZE
 DM_WIDTH, DM_HEIGHT = DM_INPUT_SIZE
 IMG_BUFFER_SHAPE = (6 * (ModelConstants.MODEL_RUN_FREQ // ModelConstants.MODEL_CONTEXT_FREQ + 1), MODEL_HEIGHT // 2, MODEL_WIDTH // 2)
 
-# All cameras we support for now
 CAMERA_CONFIGS = {
-  'ar_ox': _ar_ox_config.fcam,
-  'os': _os_config.fcam,
+  'ar_ox': _ar_ox_config.fcam,  # tici/tizi: 1928x1208
+  'os': _os_config.fcam,        # mici: 1344x760
 }
 
 UV_SCALE_MATRIX = np.array([[0.5, 0, 0], [0, 0.5, 0], [0, 0, 1]], dtype=np.float32)
@@ -169,6 +168,7 @@ def compile_warp_for_camera(cam_width: int, cam_height: int):
   # Verify loaded pickle works
   jit = pickle.load(open(pkl_path, "rb"))
   jit(*inputs)
+  print(f"  Verified pickle loads correctly")
 
 
 def compile_dm_warp_for_camera(cam_width: int, cam_height: int):
