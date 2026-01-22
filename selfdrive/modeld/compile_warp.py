@@ -14,10 +14,14 @@ from openpilot.selfdrive.modeld.constants import ModelConstants
 
 MODELS_DIR = Path(__file__).parent / 'models'
 
+# Model input sizes from common/transformations/model.py
 MODEL_WIDTH, MODEL_HEIGHT = MEDMODEL_INPUT_SIZE
 DM_WIDTH, DM_HEIGHT = DM_INPUT_SIZE
+
+# Image buffer shape for modeld
 IMG_BUFFER_SHAPE = (6 * (ModelConstants.MODEL_RUN_FREQ // ModelConstants.MODEL_CONTEXT_FREQ + 1), MODEL_HEIGHT // 2, MODEL_WIDTH // 2)
 
+# Camera configurations to compile warps for
 CAMERA_CONFIGS = {
   'ar_ox': _ar_ox_config.fcam,  # tici/tizi: 1928x1208
   'os': _os_config.fcam,        # mici: 1344x760
@@ -68,6 +72,7 @@ def frames_to_tensor(frames):
 
 
 def make_frame_prepare_tinygrad(cam_width: int, cam_height: int):
+  """Create a frame_prepare function for a specific camera resolution."""
   stride, y_height, _, _ = get_nv12_info(cam_width, cam_height)
   uv_offset = stride * y_height
 
@@ -92,6 +97,7 @@ def make_frame_prepare_tinygrad(cam_width: int, cam_height: int):
 
 
 def make_update_img_input_tinygrad(frame_prepare_fn):
+  """Create an update_img_input function with a specific frame_prepare function."""
   def update_img_input_tinygrad(tensor, frame, M_inv):
     M_inv = M_inv.to(Device.DEFAULT)
     new_img = frame_prepare_fn(frame, M_inv)
@@ -102,6 +108,7 @@ def make_update_img_input_tinygrad(frame_prepare_fn):
 
 
 def make_update_both_imgs_tinygrad(frame_prepare_fn):
+  """Create the update_both_imgs function for a specific camera resolution."""
   update_img_fn = make_update_img_input_tinygrad(frame_prepare_fn)
 
   def update_both_imgs_tinygrad(calib_img_buffer, new_img, M_inv,
@@ -114,7 +121,8 @@ def make_update_both_imgs_tinygrad(frame_prepare_fn):
 
 
 def make_dm_warp_tinygrad(cam_width: int, cam_height: int):
-  stride, _, _, _ = get_nv12_info(cam_width, cam_height)
+  """Create a DM warp function for a specific camera resolution."""
+  stride, y_height, _, _ = get_nv12_info(cam_width, cam_height)
 
   def warp_dm(input_frame, M_inv):
     M_inv = M_inv.to(Device.DEFAULT)
@@ -127,6 +135,7 @@ def make_dm_warp_tinygrad(cam_width: int, cam_height: int):
 
 
 def compile_warp_for_camera(cam_width: int, cam_height: int):
+  """Compile and save warp pickle for a specific camera resolution."""
   from tinygrad.engine.jit import TinyJit
 
   print(f"\n=== Compiling modeld warp for {cam_width}x{cam_height} ===")
@@ -140,6 +149,7 @@ def compile_warp_for_camera(cam_width: int, cam_height: int):
   full_buffer = Tensor.zeros(IMG_BUFFER_SHAPE, dtype='uint8').contiguous().realize()
   big_full_buffer = Tensor.zeros(IMG_BUFFER_SHAPE, dtype='uint8').contiguous().realize()
 
+  step_times = []
   for i in range(10):
     new_frame_np = (32*np.random.randn(yuv_size).astype(np.float32) + 128).clip(0, 255).astype(np.uint8)
     img_inputs = [full_buffer,
@@ -158,7 +168,8 @@ def compile_warp_for_camera(cam_width: int, cam_height: int):
     mt = time.perf_counter()
     Device.default.synchronize()
     et = time.perf_counter()
-    print(f"  iter {i}: enqueue {(mt-st)*1e3:6.2f} ms -- total run {(et-st)*1e3:6.2f} ms")
+    step_times.append((et-st)*1e3)
+    print(f"  iter {i}: enqueue {(mt-st)*1e3:6.2f} ms -- total run {step_times[-1]:6.2f} ms")
 
   pkl_path = get_warp_pkl_path(cam_width, cam_height)
   with open(pkl_path, "wb") as f:
@@ -172,6 +183,7 @@ def compile_warp_for_camera(cam_width: int, cam_height: int):
 
 
 def compile_dm_warp_for_camera(cam_width: int, cam_height: int):
+  """Compile and save DM warp pickle for a specific camera resolution."""
   from tinygrad.engine.jit import TinyJit
 
   print(f"\n=== Compiling DM warp for {cam_width}x{cam_height} ===")
@@ -181,17 +193,19 @@ def compile_dm_warp_for_camera(cam_width: int, cam_height: int):
   warp_dm_fn = make_dm_warp_tinygrad(cam_width, cam_height)
   warp_dm_jit = TinyJit(warp_dm_fn, prune=True)
 
+  step_times = []
   for i in range(10):
     inputs = [Tensor.from_blob((32*Tensor.randn(yuv_size,) + 128).cast(dtype='uint8').realize().numpy().ctypes.data, (yuv_size,), dtype='uint8'),
               Tensor(Tensor.randn(3, 3).mul(8).realize().numpy(), device='NPY')]
 
     Device.default.synchronize()
     st = time.perf_counter()
-    warp_dm_jit(*inputs)
+    out = warp_dm_jit(*inputs)
     mt = time.perf_counter()
     Device.default.synchronize()
     et = time.perf_counter()
-    print(f"  iter {i}: enqueue {(mt-st)*1e3:6.2f} ms -- total run {(et-st)*1e3:6.2f} ms")
+    step_times.append((et-st)*1e3)
+    print(f"  iter {i}: enqueue {(mt-st)*1e3:6.2f} ms -- total run {step_times[-1]:6.2f} ms")
 
   pkl_path = get_dm_warp_pkl_path(cam_width, cam_height)
   with open(pkl_path, "wb") as f:
@@ -200,6 +214,7 @@ def compile_dm_warp_for_camera(cam_width: int, cam_height: int):
 
 
 def run_and_save_pickle():
+  """Compile warps for all supported camera configurations."""
   for name, cam in CAMERA_CONFIGS.items():
     print(f"\nProcessing camera config: {name} ({cam.width}x{cam.height})")
     compile_warp_for_camera(cam.width, cam.height)
